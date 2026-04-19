@@ -243,7 +243,7 @@ function generateTicketId(type, reference) {
   const suffix = reference.slice(-5).toUpperCase();
   const rand   = Math.floor(100 + Math.random() * 900);
   const prefix = type === 'VIP' ? 'VIP' : 'REG';
-  return `${prefix}-HSE-${suffix}-${rand}`;
+  return `${prefix}-ASP-${suffix}-${rand}`;
 }
 
 async function ticketExists(reference) {
