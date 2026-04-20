@@ -76,7 +76,7 @@ app.post('/process-ticket', async (req, res) => {
     const amountGHS = txData.amount / 100;
 
     // 3. Process and issue ticket
-    await processAndIssueTicket({ reference, amountGHS, emaila, phone, name });
+    await processAndIssueTicket({ reference, amountGHS, email, phone, name });
 
     res.json({ status: 'success', message: 'Ticket issued and sent!' });
 
