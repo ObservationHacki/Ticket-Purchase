@@ -1,7 +1,6 @@
 const express = require('express');
 const axios = require('axios');
 const nodemailer = require('nodemailer');
-const { google } = require('googleapis');
 const crypto = require('crypto');
 const cors = require('cors');
 require('dotenv').config();
@@ -11,20 +10,17 @@ app.use(cors());
 app.use(express.json());
 
 // ============================================================
-// GOOGLE SHEETS AUTH
+// AIRTABLE CONFIG
 // ============================================================
-const auth = new google.auth.GoogleAuth({
-  credentials: {
-    client_email: process.env.GOOGLE_CLIENT_EMAIL,
-    private_key: process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
-  },
-  scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-});
+const AIRTABLE_TOKEN = process.env.AIRTABLE_TOKEN;
+const AIRTABLE_BASE  = process.env.AIRTABLE_BASE;
+const AIRTABLE_TABLE = 'Tickets';
+const AIRTABLE_URL   = `https://api.airtable.com/v0/${AIRTABLE_BASE}/${AIRTABLE_TABLE}`;
 
-async function getSheet() {
-  const client = await auth.getClient();
-  return google.sheets({ version: 'v4', auth: client });
-}
+const airtableHeaders = {
+  Authorization: `Bearer ${AIRTABLE_TOKEN}`,
+  'Content-Type': 'application/json',
+};
 
 // ============================================================
 // EMAIL TRANSPORTER (Gmail)
@@ -33,7 +29,7 @@ const transporter = nodemailer.createTransport({
   service: 'gmail',
   auth: {
     user: process.env.GMAIL_USER,
-    pass: process.env.GMAIL_APP_PASSWORD, // Gmail App Password (not your real password)
+    pass: process.env.GMAIL_APP_PASSWORD,
   },
 });
 
@@ -41,7 +37,7 @@ const transporter = nodemailer.createTransport({
 // HEALTH CHECK
 // ============================================================
 app.get('/', (req, res) => {
-  res.json({ status: 'The Heights Ticketing API is live ✓' });
+  res.json({ status: 'A.S.P Ticketing API is live ✓' });
 });
 
 // ============================================================
@@ -49,6 +45,7 @@ app.get('/', (req, res) => {
 // ============================================================
 app.post('/process-ticket', async (req, res) => {
   const { reference, name, email, phone } = req.body;
+  console.log('Received /process-ticket:', { reference, name, email, phone });
 
   if (!reference || !email || !name) {
     return res.status(400).json({ status: 'error', message: 'Missing required fields' });
@@ -56,26 +53,30 @@ app.post('/process-ticket', async (req, res) => {
 
   try {
     // 1. Verify payment with Paystack
+    console.log('Verifying with Paystack...');
     const paystackRes = await axios.get(
       `https://api.paystack.co/transaction/verify/${reference}`,
       { headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` } }
     );
 
     const txData = paystackRes.data.data;
+    console.log('Paystack status:', txData.status, '| Amount (kobo):', txData.amount);
+
     if (txData.status !== 'success') {
-      return res.status(402).json({ status: 'error', message: 'Payment not confirmed' });
+      return res.status(402).json({ status: 'error', message: 'Payment not confirmed by Paystack' });
     }
 
     // 2. Check for duplicate
     const exists = await ticketExists(reference);
     if (exists) {
+      console.log('Duplicate ticket request for reference:', reference);
       return res.json({ status: 'duplicate', message: 'Ticket already issued' });
     }
 
     const amountGHS = txData.amount / 100;
 
     // 3. Process and issue ticket
-    await processAndIssueTicket({ reference, amountGHS, email, phone, name });
+    await processAndIssueTicket({ reference, amountGHS, emaila, phone, name });
 
     res.json({ status: 'success', message: 'Ticket issued and sent!' });
 
@@ -89,7 +90,6 @@ app.post('/process-ticket', async (req, res) => {
 // PAYSTACK WEBHOOK — failsafe if browser closes after payment
 // ============================================================
 app.post('/webhook', async (req, res) => {
-  // Verify webhook signature
   const hash = crypto
     .createHmac('sha512', process.env.PAYSTACK_SECRET_KEY)
     .update(JSON.stringify(req.body))
@@ -102,11 +102,13 @@ app.post('/webhook', async (req, res) => {
   const { event, data } = req.body;
   if (event !== 'charge.success') return res.sendStatus(200);
 
+  console.log('Webhook received for reference:', data.reference);
+
   try {
     const exists = await ticketExists(data.reference);
     if (exists) return res.sendStatus(200);
 
-    const name  = extractMeta(data, 'full_name')    || `${data.customer.first_name} ${data.customer.last_name}`.trim();
+    const name  = extractMeta(data, 'full_name')    || `${data.customer.first_name || ''} ${data.customer.last_name || ''}`.trim();
     const phone = extractMeta(data, 'phone_number') || data.customer.phone || '';
 
     await processAndIssueTicket({
@@ -134,55 +136,36 @@ app.get('/checkin', async (req, res) => {
   }
 
   try {
-    const sheets = await getSheet();
-    const response = await sheets.spreadsheets.values.get({
-      spreadsheetId: process.env.SHEET_ID,
-      range: `${process.env.SHEET_NAME}!A:K`,
-    });
+    const record = await findTicketRecord(ticketId);
 
-    const rows = response.data.values || [];
-    const headers = rows[0];
-    const ticketIdCol  = headers.indexOf('Ticket ID');
-    const statusCol    = headers.indexOf('Status');
-    const nameCol      = headers.indexOf('Name');
-    const typeCol      = headers.indexOf('Ticket Type');
-    const checkinCol   = headers.indexOf('Check-In Time');
-
-    for (let i = 1; i < rows.length; i++) {
-      if (rows[i][ticketIdCol] === ticketId) {
-        if (rows[i][statusCol] === 'USED') {
-          return res.json({
-            status: 'already_used',
-            message: 'TICKET ALREADY SCANNED',
-            name: rows[i][nameCol],
-            ticketType: rows[i][typeCol],
-          });
-        }
-
-        // Mark as USED
-        const rowNum = i + 1;
-        await sheets.spreadsheets.values.batchUpdate({
-          spreadsheetId: process.env.SHEET_ID,
-          requestBody: {
-            valueInputOption: 'RAW',
-            data: [
-              { range: `${process.env.SHEET_NAME}!J${rowNum}`, values: [['USED']] },
-              { range: `${process.env.SHEET_NAME}!K${rowNum}`, values: [[new Date().toISOString()]] },
-            ],
-          },
-        });
-
-        return res.json({
-          status: 'success',
-          message: 'VALID — ADMIT',
-          name: rows[i][nameCol],
-          ticketType: rows[i][typeCol],
-          ticketId,
-        });
-      }
+    if (!record) {
+      return res.json({ status: 'not_found', message: 'INVALID TICKET' });
     }
 
-    res.json({ status: 'not_found', message: 'INVALID TICKET' });
+    if (record.fields['Status'] === 'USED') {
+      return res.json({
+        status: 'already_used',
+        message: 'TICKET ALREADY SCANNED',
+        name: record.fields['Name'],
+        ticketType: record.fields['Ticket Type'],
+      });
+    }
+
+    // Mark as USED
+    await axios.patch(`${AIRTABLE_URL}/${record.id}`, {
+      fields: {
+        Status: 'USED',
+        'Check-In Time': new Date().toISOString(),
+      },
+    }, { headers: airtableHeaders });
+
+    return res.json({
+      status: 'success',
+      message: 'VALID — ADMIT',
+      name: record.fields['Name'],
+      ticketType: record.fields['Ticket Type'],
+      ticketId,
+    });
 
   } catch (err) {
     console.error('Checkin error:', err.message);
@@ -191,35 +174,19 @@ app.get('/checkin', async (req, res) => {
 });
 
 // ============================================================
-// VERIFY (read-only lookup for staff)
+// VERIFY — read-only lookup for staff
 // ============================================================
 app.get('/verify', async (req, res) => {
   const { ticketId } = req.query;
   try {
-    const sheets = await getSheet();
-    const response = await sheets.spreadsheets.values.get({
-      spreadsheetId: process.env.SHEET_ID,
-      range: `${process.env.SHEET_NAME}!A:K`,
+    const record = await findTicketRecord(ticketId);
+    if (!record) return res.json({ found: false });
+    return res.json({
+      found: true,
+      name: record.fields['Name'],
+      ticketType: record.fields['Ticket Type'],
+      status: record.fields['Status'],
     });
-
-    const rows = response.data.values || [];
-    const headers = rows[0];
-    const ticketIdCol = headers.indexOf('Ticket ID');
-    const statusCol   = headers.indexOf('Status');
-    const nameCol     = headers.indexOf('Name');
-    const typeCol     = headers.indexOf('Ticket Type');
-
-    for (let i = 1; i < rows.length; i++) {
-      if (rows[i][ticketIdCol] === ticketId) {
-        return res.json({
-          found: true,
-          name: rows[i][nameCol],
-          ticketType: rows[i][typeCol],
-          status: rows[i][statusCol],
-        });
-      }
-    }
-    res.json({ found: false });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
   }
@@ -233,10 +200,12 @@ async function processAndIssueTicket({ reference, amountGHS, email, phone, name 
   const ticketId   = generateTicketId(ticketType, reference);
   const qrData     = `${name} | ${ticketId} | ${ticketType.toUpperCase()}`;
 
-  await saveTicket({ name, email, phone, ticketType, ticketId, reference, qrData, amountGHS });
+  console.log(`Issuing ticket: ${ticketId} | ${ticketType} | ${email}`);
+
+  await saveTicketToAirtable({ name, email, phone, ticketType, ticketId, reference, qrData, amountGHS });
   await sendTicketEmail({ name, email, ticketType, ticketId, qrData, reference, amountGHS });
 
-  console.log(`✓ Ticket issued: ${ticketId} → ${email}`);
+  console.log(`✓ Ticket issued and emailed: ${ticketId} → ${email}`);
 }
 
 function generateTicketId(type, reference) {
@@ -246,54 +215,59 @@ function generateTicketId(type, reference) {
   return `${prefix}-ASP-${suffix}-${rand}`;
 }
 
+// ============================================================
+// AIRTABLE FUNCTIONS
+// ============================================================
+async function saveTicketToAirtable({ name, email, phone, ticketType, ticketId, reference, qrData, amountGHS }) {
+  const response = await axios.post(AIRTABLE_URL, {
+    fields: {
+      Timestamp:         new Date().toISOString(),
+      Name:              name,
+      Email:             email,
+      Phone:             phone,
+      'Ticket Type':     ticketType.toUpperCase(),
+      'Ticket ID':       ticketId,
+      'Transaction Ref': reference,
+      'Amount (GHS)':    amountGHS,
+      'QR Data':         qrData,
+      Status:            'UNUSED',
+      'Check-In Time':   '',
+    },
+  }, { headers: airtableHeaders });
+
+  console.log('Saved to Airtable:', response.data.id);
+  return response.data;
+}
+
 async function ticketExists(reference) {
   try {
-    const sheets = await getSheet();
-    const response = await sheets.spreadsheets.values.get({
-      spreadsheetId: process.env.SHEET_ID,
-      range: `${process.env.SHEET_NAME}!G:G`,
+    const response = await axios.get(AIRTABLE_URL, {
+      headers: airtableHeaders,
+      params: {
+        filterByFormula: `{Transaction Ref} = '${reference}'`,
+        maxRecords: 1,
+      },
     });
-    const refs = (response.data.values || []).flat();
-    return refs.includes(reference);
+    return response.data.records.length > 0;
   } catch {
     return false;
   }
 }
 
-async function saveTicket({ name, email, phone, ticketType, ticketId, reference, qrData, amountGHS }) {
-  const sheets = await getSheet();
-
-  // Add headers if sheet is empty
-  const check = await sheets.spreadsheets.values.get({
-    spreadsheetId: process.env.SHEET_ID,
-    range: `${process.env.SHEET_NAME}!A1`,
-  });
-
-  if (!check.data.values) {
-    await sheets.spreadsheets.values.update({
-      spreadsheetId: process.env.SHEET_ID,
-      range: `${process.env.SHEET_NAME}!A1`,
-      valueInputOption: 'RAW',
-      requestBody: {
-        values: [['Timestamp','Name','Email','Phone','Ticket Type','Ticket ID','Transaction Ref','Amount (GHS)','QR Data','Status','Check-In Time']],
-      },
-    });
-  }
-
-  await sheets.spreadsheets.values.append({
-    spreadsheetId: process.env.SHEET_ID,
-    range: `${process.env.SHEET_NAME}!A:K`,
-    valueInputOption: 'RAW',
-    requestBody: {
-      values: [[
-        new Date().toISOString(), name, email, phone,
-        ticketType.toUpperCase(), ticketId, reference,
-        amountGHS, qrData, 'UNUSED', ''
-      ]],
+async function findTicketRecord(ticketId) {
+  const response = await axios.get(AIRTABLE_URL, {
+    headers: airtableHeaders,
+    params: {
+      filterByFormula: `{Ticket ID} = '${ticketId}'`,
+      maxRecords: 1,
     },
   });
+  return response.data.records[0] || null;
 }
 
+// ============================================================
+// EMAIL
+// ============================================================
 async function sendTicketEmail({ name, email, ticketType, ticketId, qrData, reference, amountGHS }) {
   const isVip  = ticketType === 'VIP';
   const accent = isVip ? '#C9A84C' : '#888888';
@@ -304,7 +278,7 @@ async function sendTicketEmail({ name, email, ticketType, ticketId, qrData, refe
 <table width="100%" style="padding:40px 20px;"><tr><td align="center">
 <table width="560" style="max-width:560px;width:100%;">
   <tr><td style="text-align:center;padding:0 0 24px;">
-    <h1 style="font-family:Georgia,serif;font-size:52px;color:#F2EDE4;margin:0;letter-spacing:-0.02em;">THE HEIGHTS</h1>
+    <h1 style="font-family:Georgia,serif;font-size:52px;color:#F2EDE4;margin:0;letter-spacing:-0.02em;">A.S.P</h1>
     <p style="font-size:10px;letter-spacing:0.25em;color:${accent};text-transform:uppercase;margin:8px 0 0;">
       ${isVip ? '&#x2736; VIP Experience &#x2736;' : 'General Entry'}</p>
   </td></tr>
@@ -338,17 +312,22 @@ async function sendTicketEmail({ name, email, ticketType, ticketId, qrData, refe
       <span style="font-size:11px;color:#555;">Non-transferable. One entry only.</span>
     </p>
   </td></tr>
+  <tr><td style="border-top:1px solid #1f1f1f;padding:24px 0;text-align:center;">
+    <p style="font-size:9px;letter-spacing:0.2em;color:#444;text-transform:uppercase;margin:0;">A.S.P · Questions? Reply to this email</p>
+  </td></tr>
 </table>
 </td></tr></table>
 </body></html>`;
 
   await transporter.sendMail({
-    from: `"The Heights" <${process.env.GMAIL_USER}>`,
+    from: `"A.S.P" <${process.env.GMAIL_USER}>`,
     to: email,
-    subject: `Your Ticket — The Heights (${ticketId})`,
+    subject: `Your Ticket — A.S.P (${ticketId})`,
     text: `Ticket ID: ${ticketId} | ${ticketType.toUpperCase()} | ${process.env.EVENT_DATE}`,
     html,
   });
+
+  console.log('Email sent to:', email);
 }
 
 function extractMeta(data, key) {
@@ -359,4 +338,4 @@ function extractMeta(data, key) {
 
 // ============================================================
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`The Heights API running on port ${PORT}`));
+app.listen(PORT, () => console.log(`A.S.P Ticketing API running on port ${PORT}`));
