@@ -6,7 +6,12 @@ const cors = require('cors');
 require('dotenv').config();
 
 const app = express();
-app.use(cors());
+app.use(cors({
+  origin: "*",
+  methods: ["GET", "POST", "PATCH", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"]
+}));
+app.options("*", cors());
 app.use(express.json());
 
 // ============================================================
@@ -339,4 +344,3 @@ function extractMeta(data, key) {
 // ============================================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`A.S.P Ticketing API running on port ${PORT}`));
-
